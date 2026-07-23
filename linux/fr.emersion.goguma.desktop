@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=IRC M - LITE
+Comment=IRC client for mobile devices
+Exec=goguma
+Icon=fr.emersion.goguma
+Type=Application
+# TODO: implement url handling
+# MimeType=x-scheme-handler/irc;
+# MimeType=x-scheme-handler/ircs;
+StartupNotify=true
+Categories=Network;IRCClient;
+Keywords=IRC;Chat;Messaging;

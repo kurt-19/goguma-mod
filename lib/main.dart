@@ -1,0 +1,462 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:ui';
+
+import 'package:app_links/app_links.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:share_handler/share_handler.dart';
+import 'package:workmanager/workmanager.dart';
+
+import 'additional_server_subscription.dart';
+import 'android_le.dart';
+import 'apns.dart';
+import 'app.dart';
+import 'cached_network_image.dart';
+import 'client.dart';
+import 'client_controller.dart';
+import 'database.dart';
+import 'ignore_store.dart';
+import 'irc/irc.dart';
+import 'link_preview.dart';
+import 'logging.dart';
+import 'models.dart';
+import 'notification_controller.dart';
+import 'prefs.dart';
+import 'profile_backend.dart';
+import 'push.dart';
+import 'unifiedpush.dart';
+
+Future<PushController> Function() initPush = UnifiedPushController.init;
+
+const String _userAgent = 'IRC mobile app';
+
+class UserAgentHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)..userAgent = _userAgent;
+  }
+}
+
+void main() async {
+  FlutterError.onError = log.reportFlutterError;
+  PlatformDispatcher.instance.onError = (error, stack) {
+    FlutterError.reportError(FlutterErrorDetails(
+      exception: error,
+      stack: stack,
+      library: 'goguma',
+    ));
+    return true;
+  };
+
+  await log.init();
+
+  // Override the http client implementation to set user agent
+  HttpOverrides.global = UserAgentHttpOverrides();
+  ProfileBackendClient.startAvatarEventListener();
+
+  var syncReceivePort = ReceivePort('main:sync');
+  var syncPortRegistered = false;
+  var widgetsBinding = WidgetsFlutterBinding.ensureInitialized();
+  var appLifecycleListener = AppLifecycleListener(
+    binding: widgetsBinding,
+    onStateChange: (state) {
+      if (state == AppLifecycleState.detached) {
+        if (syncPortRegistered) {
+          if (!IsolateNameServer.removePortNameMapping('main:sync')) {
+            log.print('Warning: failed to unregister sync port');
+          }
+          syncPortRegistered = false;
+        }
+      } else {
+        if (!syncPortRegistered) {
+          syncPortRegistered = IsolateNameServer.registerPortWithName(
+              syncReceivePort.sendPort, 'main:sync');
+          if (!syncPortRegistered) {
+            log.print('Warning: failed to register sync port');
+          }
+        }
+      }
+    },
+  );
+  appLifecycleListener.onStateChange!(
+      widgetsBinding.lifecycleState ?? AppLifecycleState.resumed);
+
+  var prefs = await Prefs.load();
+  log.isSentryEnabled = () => prefs.uploadErrorReports;
+  var db = await DB.open();
+  if (prefs.quitRequested) {
+    await db.clearConnectionState();
+    prefs.quitRequested = false;
+    await NotificationController.dismissNativeNotifications();
+  }
+
+  await _initWorkManager();
+
+  if (Platform.isIOS) {
+    initPush = wrapApnsInitPush(initPush);
+  }
+
+  PushController? pushController;
+  try {
+    pushController = await initPush();
+  } on PushUnavailableException catch (err) {
+    log.print('Push notifications unavailable: $err');
+  } on Exception catch (err) {
+    log.print('Warning: failed to initialize push controller', error: err);
+  }
+
+  if (Platform.isAndroid) {
+    trustIsrgRootX1();
+  }
+
+  var appLinks = AppLinks();
+  IrcUri? initialUri;
+  SharedMedia? initialSharedMedia;
+  if (Platform.isAndroid || Platform.isIOS) {
+    var initialUriStr = await appLinks.getInitialLinkString();
+    if (initialUriStr != null) {
+      initialUri = IrcUri.parse(initialUriStr);
+    }
+
+    if (initialUri == null) {
+      initialSharedMedia = await ShareHandler.instance.getInitialSharedMedia();
+      await ShareHandler.instance.resetInitialSharedMedia();
+    }
+  }
+
+  var notifController = await NotificationController.init();
+  var serverSubscription = AdditionalServerSubscription();
+  await serverSubscription.initialize();
+
+  // If the push provider has changed, wipe our Web Push subscriptions table.
+  // Ideally we'd unregister old subscriptions, but it's too late at this
+  // point.
+  String? pushProviderName = pushController?.providerName;
+  if (pushProviderName != prefs.pushProvider) {
+    var subs = await db.listWebPushSubscriptions();
+    log.print(
+        'Push provider changed (${prefs.pushProvider} -> $pushProviderName), clearing ${subs.length} subscriptions');
+    List<Future<void>> futures = [];
+    for (var sub in subs) {
+      futures.add(db.deleteWebPushSubscription(sub.id!));
+    }
+    await Future.wait(futures);
+    prefs.pushProvider = pushProviderName;
+  }
+
+  var networkList = NetworkListModel();
+  var bufferList = BufferListModel();
+  var bouncerNetworkList = BouncerNetworkListModel();
+  var clientProvider = ClientProvider(
+    db: db,
+    networkList: networkList,
+    bufferList: bufferList,
+    bouncerNetworkList: bouncerNetworkList,
+    notifController: notifController,
+    serverSubscription: serverSubscription,
+    pushController: pushController,
+  );
+
+  await _initModels(
+    db: db,
+    prefs: prefs,
+    clientProvider: clientProvider,
+    networkList: networkList,
+    bufferList: bufferList,
+  );
+
+  // Listen for sync requests coming from the work manager Isolate
+  syncReceivePort.listen((data) async {
+    var sendPort = data as SendPort;
+    try {
+      await _syncChatHistory(clientProvider, networkList);
+      sendPort.send(true);
+    } on Object {
+      sendPort.send(false);
+      rethrow;
+    }
+  });
+
+  unawaited(Future.delayed(Duration(seconds: 15), pruneNetworkImageCache));
+
+  runApp(MultiProvider(
+    providers: [
+      Provider<DB>.value(value: db),
+      Provider<ClientProvider>.value(value: clientProvider),
+      Provider<NotificationController>.value(value: notifController),
+      ChangeNotifierProvider<AdditionalServerSubscription>.value(
+          value: serverSubscription),
+      Provider<Prefs>.value(value: prefs),
+      Provider<AppLinks>.value(value: appLinks),
+      ChangeNotifierProvider<NetworkListModel>.value(value: networkList),
+      ChangeNotifierProvider<BufferListModel>.value(value: bufferList),
+      ChangeNotifierProvider<BouncerNetworkListModel>.value(
+          value: bouncerNetworkList),
+      Provider<LinkPreviewer>(
+        create: (context) => LinkPreviewer(db),
+        dispose: (context, linkPreviewer) => linkPreviewer.dispose(),
+      ),
+    ],
+    child: App(initialUri: initialUri, initialSharedMedia: initialSharedMedia),
+  ));
+}
+
+Future<void> _initModels({
+  required DB db,
+  required Prefs prefs,
+  required ClientProvider clientProvider,
+  required NetworkListModel networkList,
+  required BufferListModel bufferList,
+}) async {
+  // Load all the data we need concurrently
+  var serverEntriesFuture = db.listServers();
+  var networkEntriesFuture = db.listNetworks();
+  var bufferEntriesFuture = db.listBuffers();
+  var unreadCountsFuture = db.listBuffersUnreadCount();
+  var lastDeliveredTimesFuture = db.listBuffersLastDeliveredTime();
+
+  var serverEntries = await serverEntriesFuture;
+  var networkEntries = await networkEntriesFuture;
+  var bufferEntries = await bufferEntriesFuture;
+  var unreadCounts = await unreadCountsFuture;
+  var lastDeliveredTimes = await lastDeliveredTimesFuture;
+
+  Map<int, ServerEntry> serverMap = Map.fromEntries(serverEntries.map((entry) {
+    return MapEntry(entry.id!, entry);
+  }));
+
+  for (var networkEntry in networkEntries) {
+    var serverEntry = serverMap[networkEntry.server]!;
+
+    var clientParams = connectParamsFromServerEntry(serverEntry, prefs);
+    if (networkEntry.bouncerId != null) {
+      clientParams = clientParams.apply(bouncerNetId: networkEntry.bouncerId);
+    }
+
+    var network = NetworkModel(
+        serverEntry, networkEntry, clientParams.nick, clientParams.realname);
+    network.setIgnoredNicks(await loadIgnoredNicks());
+    networkList.add(network);
+
+    var client = Client(clientParams,
+        lastIsupport: networkEntry.isupport,
+        lastAvailableCaps: networkEntry.caps);
+    clientProvider.add(client, network);
+  }
+
+  for (var entry in bufferEntries) {
+    var network = networkList.networks
+        .firstWhere((network) => network.networkId == entry.network);
+    var buffer = BufferModel(entry: entry, network: network);
+    bufferList.add(buffer);
+
+    buffer.unreadCount = unreadCounts[buffer.id] ?? 0;
+    if (lastDeliveredTimes[buffer.id] != null) {
+      bufferList.bumpLastDeliveredTime(buffer, lastDeliveredTimes[buffer.id]!);
+    }
+  }
+
+  for (var network in networkList.networks) {
+    if (bufferList.get(statusBufferName, network) != null ||
+        bufferList.get('*', network) != null) {
+    } else {
+      var entry = await db.storeBuffer(
+          BufferEntry(name: statusBufferName, network: network.networkId));
+      bufferList.add(BufferModel(entry: entry, network: network));
+    }
+
+    var chatBuffer = bufferList.get(defaultChatChannelName, network);
+    if (chatBuffer == null) {
+      var entry = await db.storeBuffer(BufferEntry(
+          name: defaultChatChannelName, network: network.networkId));
+      bufferList.add(BufferModel(entry: entry, network: network));
+    } else if (chatBuffer.archived) {
+      chatBuffer.archived = false;
+      await db.storeBuffer(chatBuffer.entry);
+    }
+  }
+}
+
+Future<void> _initWorkManager() async {
+  if (!Platform.isAndroid) {
+    return;
+  }
+
+  await Workmanager().initialize(_dispatchWorkManager);
+
+  // Terminate any currently running sync job
+  await Workmanager().cancelAll();
+}
+
+Future<void> _syncChatHistory(
+    ClientProvider clientProvider, NetworkListModel networkList) async {
+  log.print('Starting chat history synchronization');
+
+  var autoReconnectLock = ClientAutoReconnectLock.acquire(clientProvider);
+
+  try {
+    // Make sure all connected clients are alive
+    await Future.wait(clientProvider.clients.map((client) async {
+      if (client.state != ClientState.connected) {
+        return;
+      }
+
+      // Ignore errors because the client will just try reconnecting
+      try {
+        await client.ping();
+      } on Exception catch (_) {}
+    }));
+
+    await Future.wait(networkList.networks.map((network) async {
+      try {
+        await _waitNetworkOnline(network);
+      } on Exception catch (err) {
+        log.print(
+            'Failed to bring network "${network.serverEntry.host}" online',
+            error: err);
+        rethrow;
+      }
+    }));
+
+    log.print('Finished chat history synchronization');
+  } on Object catch (err) {
+    log.print('Failed chat history synchronization', error: err);
+    rethrow;
+  } finally {
+    autoReconnectLock.release();
+  }
+}
+
+// This function is called from a separate Isolate.
+@pragma('vm:entry-point')
+void _dispatchWorkManager() {
+  Workmanager().executeTask((taskName, data) async {
+    try {
+      DartPluginRegistrant.ensureInitialized();
+      WidgetsFlutterBinding.ensureInitialized();
+      await log.init();
+
+      log.print('Executing work manager task: $taskName');
+
+      switch (taskName) {
+        case 'sync':
+          await _handleWorkManagerSync();
+          return true;
+        default:
+          throw Exception('Unknown work manager task name: $taskName');
+      }
+    } on Object catch (error, stack) {
+      FlutterError.reportError(FlutterErrorDetails(
+        exception: error,
+        stack: stack,
+        library: 'workmanager',
+      ));
+      return false;
+    }
+  });
+}
+
+Future<void> _handleWorkManagerSync() async {
+  // If the main Isolate is running, delegate synchronization
+  var sendPort = IsolateNameServer.lookupPortByName('main:sync');
+  if (sendPort != null) {
+    var receivePort = ReceivePort('work-manager:sync');
+    sendPort.send(receivePort.sendPort);
+
+    var data = await receivePort.first;
+    receivePort.close();
+    var ok = data as bool;
+    if (!ok) {
+      throw Exception('Chat history sync failed');
+    }
+    return;
+  }
+
+  // Otherwise we do the synchronization ourselves
+
+  if (Platform.isAndroid) {
+    trustIsrgRootX1();
+  }
+
+  var notifController = await NotificationController.init();
+  var serverSubscription = await AdditionalServerSubscription.fromCache();
+  var prefs = await Prefs.load();
+  var db = await DB.open();
+  if (prefs.quitRequested) {
+    await db.clearConnectionState();
+    prefs.quitRequested = false;
+    await NotificationController.dismissNativeNotifications();
+    return;
+  }
+
+  var networkList = NetworkListModel();
+  var bufferList = BufferListModel();
+  var bouncerNetworkList = BouncerNetworkListModel();
+  var clientProvider = ClientProvider(
+    db: db,
+    networkList: networkList,
+    bufferList: bufferList,
+    bouncerNetworkList: bouncerNetworkList,
+    notifController: notifController,
+    serverSubscription: serverSubscription,
+    enableSync: false,
+  );
+
+  await _initModels(
+    db: db,
+    prefs: prefs,
+    clientProvider: clientProvider,
+    networkList: networkList,
+    bufferList: bufferList,
+  );
+
+  for (var client in clientProvider.clients) {
+    client.connect(params: client.params.apply(away: '*')).ignore();
+  }
+
+  try {
+    await _syncChatHistory(clientProvider, networkList);
+  } finally {
+    for (var client in clientProvider.clients) {
+      client.dispose();
+    }
+  }
+}
+
+Future<void> _waitNetworkOnline(NetworkModel network) async {
+  if (network.state == NetworkState.online) {
+    return;
+  }
+
+  var completer = Completer<void>();
+  var attempts = 0;
+  void listener() {
+    switch (network.state) {
+      case NetworkState.offline:
+        attempts++;
+        if (attempts == 5) {
+          completer.completeError(
+              TimeoutException('Failed connecting after $attempts attempts'));
+        }
+        break;
+      case NetworkState.online:
+        completer.complete();
+        break;
+      default:
+        break;
+    }
+  }
+
+  network.addListener(listener);
+
+  try {
+    await completer.future.timeout(const Duration(minutes: 5), onTimeout: () {
+      throw TimeoutException('Timed out waiting for network to come online');
+    });
+  } finally {
+    network.removeListener(listener);
+  }
+}

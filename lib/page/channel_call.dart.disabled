@@ -1,0 +1,1105 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
+
+import '../client.dart';
+import '../irc/irc.dart';
+import '../profile_backend.dart';
+import '../widget/app_snack_bar.dart';
+import 'call.dart';
+
+const _channelCallAudioChannel = MethodChannel('com.ircmobile.app/activity');
+
+class ChannelCallPage extends StatefulWidget {
+  final CallPageArguments args;
+
+  const ChannelCallPage({required this.args, super.key});
+
+  @override
+  State<ChannelCallPage> createState() => _ChannelCallPageState();
+}
+
+class _ChannelCallPageState extends State<ChannelCallPage> {
+  final _backend = const ProfileBackendClient();
+  final _localRenderer = rtc.RTCVideoRenderer();
+  final Map<String, _ChannelPeer> _peers = {};
+  final List<rtc.RTCIceCandidate> _unusedCandidates = [];
+  final Set<String> _invitedNicks = {};
+  late final String _roomId;
+  late final String _clientId;
+
+  CallRoom? _room;
+  rtc.MediaStream? _localStream;
+  Timer? _pollTimer;
+  int _lastSeq = 0;
+  bool _joined = false;
+  bool _polling = false;
+  bool _pollInFlight = false;
+  bool _muted = false;
+  bool _updatingMute = false;
+  bool _forcedMuted = false;
+  bool _cameraOff = false;
+  bool _forcedCameraOff = false;
+  bool _speakerOn = false;
+  bool _ending = false;
+  bool _allowPop = false;
+  String _status = 'Preparing call...';
+
+  String get _nick => widget.args.nick ?? widget.args.client?.nick ?? '';
+
+  bool get _canModerate {
+    var role = _selfParticipant?.role ?? widget.args.role;
+    return role == 'creator' || role == 'irc_operator';
+  }
+
+  bool get _canEnd {
+    var role = _selfParticipant?.role ?? widget.args.role;
+    return role == 'creator' || role == 'irc_operator';
+  }
+
+  bool _canManageParticipant(CallParticipant participant) {
+    if (!_canModerate || participant.client == _clientId) return false;
+    var selfRole = _selfParticipant?.role ?? widget.args.role;
+    return participant.role != 'irc_operator' || selfRole == 'irc_operator';
+  }
+
+  CallParticipant? get _selfParticipant {
+    for (var participant in _room?.participants ?? const <CallParticipant>[]) {
+      if (participant.client == _clientId) {
+        return participant;
+      }
+    }
+    return null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _roomId = callRoomIdFromUrl(widget.args.roomUrl) ?? '';
+    _clientId = _randomClientId();
+    unawaited(_init());
+  }
+
+  Future<void> _init() async {
+    await _localRenderer.initialize();
+    try {
+      var result = await _backend.pollCallEvents(
+        roomId: _roomId,
+        clientId: _clientId,
+        after: 0,
+      );
+      if (!mounted) return;
+      setState(() {
+        _room = result.room;
+        _lastSeq = result.nextSeq;
+      });
+      await _join();
+    } on Exception catch (err) {
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    }
+  }
+
+  String _randomClientId() {
+    const chars =
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
+    var random = Random.secure();
+    return List.generate(24, (_) => chars[random.nextInt(chars.length)]).join();
+  }
+
+  Future<void> _join() async {
+    var room = _room;
+    if (room == null || _joined || room.ended) return;
+    try {
+      setState(() => _status = 'Joining call...');
+      await _backend.postCallEvent(
+        roomId: _roomId,
+        clientId: _clientId,
+        type: 'join',
+        payload: {
+          'nick': _nick,
+          'role': widget.args.role,
+          'mode': room.mode,
+          'controlToken': widget.args.controlToken,
+        },
+      );
+      _joined = true;
+      setState(() => _status = 'Opening microphone...');
+      var audioConstraints = Platform.isAndroid
+          ? <String, dynamic>{
+              'mandatory': <String, dynamic>{},
+              'optional': <Map<String, dynamic>>[
+                {'googEchoCancellation': true},
+                {'echoCancellation': true},
+                {'googEchoCancellation2': true},
+                {'googDAEchoCancellation': true},
+                {'googNoiseSuppression': true},
+                {'googNoiseSuppression2': true},
+                {'googHighpassFilter': true},
+                {'googAutoGainControl': false},
+                {'googAutoGainControl2': false},
+              ],
+            }
+          : <String, dynamic>{
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': false,
+            };
+      var stream = await rtc.navigator.mediaDevices.getUserMedia({
+        'audio': audioConstraints,
+        'video': room.video ? <String, dynamic>{'facingMode': 'user'} : false,
+      });
+      _localStream = stream;
+      _localRenderer.srcObject = stream;
+      _rememberActiveCall();
+      await rtc.Helper.setSpeakerphoneOn(false);
+
+      setState(() => _status = 'Connected');
+      _startPolling();
+    } on Exception catch (err) {
+      if (_joined) {
+        try {
+          await _postEvent('leave', {'nick': _nick});
+        } on Exception {
+          // The failed local join still needs cleanup.
+        }
+      }
+      _joined = false;
+      await _closeLocal();
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    }
+  }
+
+  void _startPolling() {
+    if (_polling) return;
+    _polling = true;
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 350), (_) {
+      unawaited(_pollEvents());
+    });
+    unawaited(_pollEvents());
+  }
+
+  Future<void> _pollEvents() async {
+    if (!_polling || _pollInFlight) return;
+    _pollInFlight = true;
+    try {
+      var result = await _backend.pollCallEvents(
+        roomId: _roomId,
+        clientId: _clientId,
+        after: _lastSeq,
+      );
+      _lastSeq = result.nextSeq;
+      _syncForcedMute(result.room);
+      if (mounted) {
+        setState(() => _room = result.room);
+      }
+      await _syncRoomParticipants(result.room);
+      for (var event in result.events) {
+        await _handleEvent(event);
+      }
+      if (result.room.ended) {
+        _finishLocally('Call ended');
+      }
+    } on Exception catch (err) {
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    } finally {
+      _pollInFlight = false;
+    }
+  }
+
+  Future<void> _syncRoomParticipants(CallRoom room) async {
+    var activeClients = room.participants
+        .where((participant) => participant.client != _clientId)
+        .map((participant) => participant.client)
+        .toSet();
+    for (var client in _peers.keys.toList()) {
+      if (!activeClients.contains(client)) {
+        await _removePeer(client);
+      }
+    }
+    for (var participant in room.participants) {
+      if (participant.client == _clientId) continue;
+      var peer = await _ensurePeer(participant.client);
+      if (_clientId.compareTo(participant.client) < 0) {
+        await _makeOffer(participant.client, peer);
+      }
+    }
+  }
+
+  Future<_ChannelPeer> _ensurePeer(String remoteClient) async {
+    var existing = _peers[remoteClient];
+    if (existing != null) return existing;
+
+    var renderer = rtc.RTCVideoRenderer();
+    await renderer.initialize();
+    var peerConnection = await rtc.createPeerConnection({
+      'iceServers': _room?.iceServers ?? const [],
+    });
+    var peer = _ChannelPeer(peerConnection, renderer);
+    _peers[remoteClient] = peer;
+
+    peerConnection.onIceCandidate = (candidate) {
+      unawaited(_postEvent('candidate', {
+        'to': remoteClient,
+        'candidate': candidate.candidate,
+        'sdpMid': candidate.sdpMid,
+        'sdpMLineIndex': candidate.sdpMLineIndex,
+      }));
+    };
+    peerConnection.onTrack = (event) {
+      if (event.streams.isNotEmpty) {
+        renderer.srcObject = event.streams.first;
+      }
+      if (mounted) setState(() {});
+    };
+    peerConnection.onConnectionState = (_) {
+      if (mounted) setState(() {});
+    };
+    var stream = _localStream;
+    if (stream != null) {
+      for (var track in stream.getTracks()) {
+        await peerConnection.addTrack(track, stream);
+      }
+    }
+    if (mounted) setState(() {});
+    return peer;
+  }
+
+  Future<void> _handleEvent(CallEvent event) async {
+    if (event.client == _clientId) return;
+    var target = event.payload['to'] as String?;
+    if (target != null && target != _clientId) return;
+
+    switch (event.type) {
+      case 'join':
+        var peer = await _ensurePeer(event.client);
+        if (_clientId.compareTo(event.client) < 0) {
+          await _makeOffer(event.client, peer);
+        }
+        break;
+      case 'offer':
+        var peer = await _ensurePeer(event.client);
+        var description = _descriptionPayload(event.payload);
+        await peer.connection.setRemoteDescription(
+          rtc.RTCSessionDescription(
+            description['sdp'] as String? ?? '',
+            description['type'] as String? ?? '',
+          ),
+        );
+        await _flushCandidates(peer);
+        var answer = await peer.connection.createAnswer();
+        await peer.connection.setLocalDescription(answer);
+        await _postEvent('answer', {
+          'to': event.client,
+          'description': _descriptionToPayload(answer),
+        });
+        break;
+      case 'answer':
+        var peer = _peers[event.client];
+        if (peer == null || !peer.waitingForAnswer) return;
+        var description = _descriptionPayload(event.payload);
+        await peer.connection.setRemoteDescription(
+          rtc.RTCSessionDescription(
+            description['sdp'] as String? ?? '',
+            description['type'] as String? ?? '',
+          ),
+        );
+        peer.waitingForAnswer = false;
+        await _flushCandidates(peer);
+        break;
+      case 'candidate':
+        var peer = await _ensurePeer(event.client);
+        var candidate = rtc.RTCIceCandidate(
+          event.payload['candidate'] as String?,
+          event.payload['sdpMid'] as String?,
+          event.payload['sdpMLineIndex'] as int?,
+        );
+        var description = await peer.connection.getRemoteDescription();
+        if (description == null) {
+          peer.pendingCandidates.add(candidate);
+        } else {
+          await peer.connection.addCandidate(candidate);
+        }
+        break;
+      case 'leave':
+        await _removePeer(event.client);
+        break;
+      case 'mute':
+        var targetNick = event.payload['nick'] as String? ?? '';
+        if (_sameNick(targetNick, _nick)) {
+          _forcedMuted = event.payload['muted'] != false;
+          _applyLocalMute();
+          if (mounted) setState(() {});
+        }
+        break;
+      case 'kick':
+        var targetNick = event.payload['nick'] as String? ?? '';
+        if (_sameNick(targetNick, _nick)) {
+          _finishLocally('Removed from call');
+        }
+        break;
+      case 'camera':
+        var targetNick = event.payload['nick'] as String? ?? '';
+        if (_sameNick(targetNick, _nick)) {
+          _forcedCameraOff = event.payload['cameraOff'] != false;
+          _applyLocalCamera();
+          if (mounted) setState(() {});
+        }
+        break;
+      case 'end':
+        _finishLocally('Call ended');
+        break;
+    }
+  }
+
+  Map<String, dynamic> _descriptionPayload(Map<String, dynamic> payload) {
+    var raw = payload['description'];
+    return raw is Map ? Map<String, dynamic>.from(raw) : payload;
+  }
+
+  Future<void> _makeOffer(String remoteClient, _ChannelPeer peer) async {
+    if (peer.makingOffer || peer.waitingForAnswer) return;
+    peer.makingOffer = true;
+    try {
+      var offer = await peer.connection.createOffer();
+      await peer.connection.setLocalDescription(offer);
+      peer.waitingForAnswer = true;
+      await _postEvent('offer', {
+        'to': remoteClient,
+        'description': _descriptionToPayload(offer),
+      });
+    } finally {
+      peer.makingOffer = false;
+    }
+  }
+
+  Map<String, dynamic> _descriptionToPayload(
+      rtc.RTCSessionDescription description) {
+    return {'sdp': description.sdp, 'type': description.type};
+  }
+
+  Future<void> _flushCandidates(_ChannelPeer peer) async {
+    while (peer.pendingCandidates.isNotEmpty) {
+      await peer.connection.addCandidate(peer.pendingCandidates.removeAt(0));
+    }
+  }
+
+  Future<void> _removePeer(String client) async {
+    var peer = _peers.remove(client);
+    if (peer == null) return;
+    await peer.connection.close();
+    await peer.renderer.dispose();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _postEvent(String type, Map<String, dynamic> payload) {
+    return _backend.postCallEvent(
+      roomId: _roomId,
+      clientId: _clientId,
+      type: type,
+      payload: payload,
+    );
+  }
+
+  Future<void> _toggleMute() async {
+    if (_forcedMuted) return;
+    var previous = _muted;
+    _muted = !_muted;
+    _applyLocalMute();
+    setState(() {});
+    _updatingMute = true;
+    try {
+      await _postEvent('media', {
+        'muted': _muted,
+        'cameraOff': _cameraOff,
+      });
+    } on Exception catch (err) {
+      _muted = previous;
+      _applyLocalMute();
+      if (mounted) {
+        setState(() => _status = err.toString());
+      }
+    } finally {
+      _updatingMute = false;
+    }
+  }
+
+  void _syncForcedMute(CallRoom room) {
+    if (_updatingMute || _muted) return;
+    CallParticipant? self;
+    for (var participant in room.participants) {
+      if (participant.client == _clientId) {
+        self = participant;
+        break;
+      }
+    }
+    if (self == null || self.muted == _forcedMuted) return;
+    _forcedMuted = self.muted;
+    _applyLocalMute();
+  }
+
+  void _applyLocalMute() {
+    var enabled = !_muted && !_forcedMuted;
+    for (var track
+        in _localStream?.getAudioTracks() ?? const <rtc.MediaStreamTrack>[]) {
+      track.enabled = enabled;
+    }
+  }
+
+  void _toggleCamera() {
+    if (_forcedCameraOff) return;
+    _cameraOff = !_cameraOff;
+    _applyLocalCamera();
+    setState(() {});
+    unawaited(_postEvent('media', {
+      'muted': _muted,
+      'cameraOff': _cameraOff,
+    }));
+  }
+
+  void _applyLocalCamera() {
+    var enabled = !_cameraOff && !_forcedCameraOff;
+    for (var track
+        in _localStream?.getVideoTracks() ?? const <rtc.MediaStreamTrack>[]) {
+      track.enabled = enabled;
+    }
+  }
+
+  Future<void> _toggleSpeaker() async {
+    _speakerOn = !_speakerOn;
+    await rtc.Helper.setSpeakerphoneOn(_speakerOn);
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _inviteUser() async {
+    var room = _room;
+    var client = widget.args.client;
+    if (!_canModerate || room == null || client == null) return;
+
+    var selected = await showDialog<String>(
+      context: context,
+      builder: (context) => _InviteUserDialog(
+        client: client,
+        channel: room.target,
+        selfNick: _nick,
+        initialMembers: widget.args.channelMemberPrefixes.isEmpty
+            ? {for (var nick in widget.args.channelMembers) nick: ''}
+            : widget.args.channelMemberPrefixes,
+        connectedNicks: () => {
+          for (var participant
+              in _room?.participants ?? const <CallParticipant>[])
+            participant.nick.toLowerCase(),
+        },
+      ),
+    );
+    if (selected == null) return;
+
+    await _postEvent('invite', {'nick': selected});
+    var separator = widget.args.roomUrl.contains('?') ? '&' : '?';
+    var inviteUrl =
+        '${widget.args.roomUrl}${separator}channel=${Uri.encodeQueryComponent(room.target)}&video=${room.video ? 1 : 0}';
+    var label = room.video ? 'video' : 'voice';
+    await client.sendTextMessage(IrcMessage('PRIVMSG', [
+      selected,
+      'channel $label call start ${room.target}: $inviteUrl',
+    ]));
+    _invitedNicks.add(selected);
+    if (mounted) {
+      showTopRightSnackBar(
+        context,
+        SnackBar(content: Text('Invite sent: $selected')),
+      );
+    }
+  }
+
+  Future<void> _moderate(CallParticipant participant, String action) async {
+    if (!_canManageParticipant(participant)) return;
+    if (action == 'mute') {
+      await _postEvent(
+          'mute', {'nick': participant.nick, 'muted': !participant.muted});
+    } else if (action == 'camera') {
+      await _postEvent('camera',
+          {'nick': participant.nick, 'cameraOff': !participant.cameraOff});
+    } else if (action == 'kick') {
+      await _postEvent('kick', {'nick': participant.nick});
+    }
+  }
+
+  Future<void> _leaveOrEnd() async {
+    if (_ending) return;
+    _ending = true;
+    try {
+      if (_canEnd) {
+        await _postEvent('end', {});
+        await _sendChannelEndMessage();
+      } else if (_joined) {
+        await _postEvent('leave', {'nick': _nick});
+      }
+    } on Exception {
+      // Local exit should still work if signaling has already stopped.
+    }
+    _finishLocally(_canEnd ? 'Call ended' : 'Left call');
+  }
+
+  void _openApp() {
+    if (!mounted) return;
+    var routeName = widget.args.returnRouteName ?? '/';
+    Navigator.of(context).pushNamed(
+      routeName,
+      arguments: widget.args.returnRouteArguments,
+    );
+  }
+
+  void _rememberActiveCall() {
+    activeCallInfo.value = ActiveCallInfo(widget.args);
+  }
+
+  void _clearActiveCall() {
+    var active = activeCallInfo.value;
+    if (active != null && active.roomUrl == widget.args.roomUrl) {
+      activeCallInfo.value = null;
+    }
+  }
+
+  void _returnToChannel() {
+    if (!mounted) return;
+    setState(() => _allowPop = true);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(Navigator.of(context).maybePop());
+      }
+    });
+  }
+
+  Future<void> _sendChannelEndMessage() async {
+    var room = _room;
+    var client = widget.args.client;
+    if (room == null || client == null || room.target.isEmpty) return;
+    var label =
+        room.video ? 'channel video call end' : 'channel voice call end';
+    try {
+      await client.sendTextMessage(IrcMessage('PRIVMSG', [room.target, label]));
+      var participantNicks = {
+        for (var participant in room.participants)
+          participant.nick.toLowerCase()
+      };
+      for (var nick in _invitedNicks) {
+        if (participantNicks.contains(nick.toLowerCase())) {
+          continue;
+        }
+        await client.sendTextMessage(IrcMessage('PRIVMSG', [nick, label]));
+      }
+    } on Exception {
+      // Signaling end is authoritative.
+    }
+  }
+
+  void _finishLocally(String status) {
+    if (!_polling && !_joined) return;
+    _clearActiveCall();
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _polling = false;
+    _joined = false;
+    unawaited(_closeLocal());
+    if (mounted) {
+      setState(() {
+        _status = status;
+        _allowPop = true;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
+          unawaited(Navigator.of(context).maybePop());
+        }
+      });
+    }
+  }
+
+  Future<void> _closeLocal() async {
+    for (var client in _peers.keys.toList()) {
+      await _removePeer(client);
+    }
+    for (var track
+        in _localStream?.getTracks() ?? const <rtc.MediaStreamTrack>[]) {
+      await track.stop();
+    }
+    await _localStream?.dispose();
+    _localStream = null;
+    _localRenderer.srcObject = null;
+    try {
+      await rtc.Helper.setSpeakerphoneOn(false);
+      if (Platform.isAndroid) {
+        await rtc.Helper.clearAndroidCommunicationDevice();
+      }
+    } on Exception {
+      // Ignore audio route cleanup errors.
+    }
+    if (Platform.isAndroid) {
+      try {
+        await _channelCallAudioChannel
+            .invokeMethod<void>('clearCallAudioRoute');
+      } on Exception {
+        // Ignore audio route cleanup errors.
+      }
+    }
+  }
+
+  bool _sameNick(String a, String b) => a.toLowerCase() == b.toLowerCase();
+
+  CallParticipant? _participantForClient(String client) {
+    for (var participant in _room?.participants ?? const <CallParticipant>[]) {
+      if (participant.client == client) return participant;
+    }
+    return null;
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    if (_joined && !_ending) {
+      unawaited(_postEvent('leave', {'nick': _nick}));
+    }
+    _clearActiveCall();
+    unawaited(_closeLocal());
+    unawaited(_localRenderer.dispose());
+    _unusedCandidates.clear();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var room = _room;
+    var scheme = Theme.of(context).colorScheme;
+    var participants = room?.participants ?? const <CallParticipant>[];
+    var video = room?.video ?? widget.args.video ?? false;
+    return PopScope(
+      canPop: !_joined || _allowPop,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          _openApp();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: _joined
+              ? IconButton(
+                  tooltip: 'Back to app',
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: _openApp,
+                )
+              : null,
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(video ? 'Channel video call' : 'Channel voice call'),
+              Text(
+                room?.target ?? widget.args.target ?? '',
+                style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
+              ),
+            ],
+          ),
+          actions: [
+            if (_canModerate)
+              IconButton(
+                tooltip: 'Invite user',
+                onPressed: _inviteUser,
+                icon: const Icon(Icons.person_add_alt_1),
+              ),
+          ],
+        ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              Expanded(
+                child: video
+                    ? _buildVideoGrid(participants)
+                    : _buildVoiceList(participants),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 16),
+                child: Column(
+                  children: [
+                    Text(_status,
+                        style: TextStyle(color: scheme.onSurfaceVariant)),
+                    const SizedBox(height: 10),
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed:
+                              _joined && !_forcedMuted ? _toggleMute : null,
+                          icon: Icon(_muted || _forcedMuted
+                              ? Icons.mic_off
+                              : Icons.mic),
+                          label: Text(_forcedMuted
+                              ? 'Muted by operator'
+                              : _muted
+                                  ? 'Unmute'
+                                  : 'Mute'),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: _joined ? _toggleSpeaker : null,
+                          icon: Icon(_speakerOn
+                              ? Icons.volume_up
+                              : Icons.phone_in_talk),
+                          label: Text(_speakerOn ? 'Earpiece' : 'Speaker'),
+                        ),
+                        if (video)
+                          FilledButton.tonalIcon(
+                            onPressed: _joined && !_forcedCameraOff
+                                ? _toggleCamera
+                                : null,
+                            icon: Icon(_cameraOff || _forcedCameraOff
+                                ? Icons.videocam_off
+                                : Icons.videocam),
+                            label: Text(_forcedCameraOff
+                                ? 'Camera disabled'
+                                : _cameraOff
+                                    ? 'Camera on'
+                                    : 'Camera off'),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _joined ? _leaveOrEnd : _returnToChannel,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFFC62828),
+                          foregroundColor: Colors.white,
+                        ),
+                        icon: Icon(_joined
+                            ? (_canEnd ? Icons.call_end : Icons.logout)
+                            : Icons.arrow_back),
+                        label: Text(_joined
+                            ? (_canEnd ? 'End Channel Call' : 'Leave Call')
+                            : 'Back to Channel'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildVoiceList(List<CallParticipant> participants) {
+    return ListView.separated(
+      padding: const EdgeInsets.all(12),
+      itemCount: participants.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 8),
+      itemBuilder: (context, index) =>
+          _participantTile(participants[index], video: false),
+    );
+  }
+
+  Widget _buildVideoGrid(List<CallParticipant> participants) {
+    var tiles = <Widget>[
+      _videoTile(_nick, _localRenderer, local: true),
+      for (var entry in _peers.entries)
+        _videoTile(
+          _participantForClient(entry.key)?.nick ?? entry.key,
+          entry.value.renderer,
+          participant: _participantForClient(entry.key),
+        ),
+    ];
+    return GridView.builder(
+      padding: const EdgeInsets.all(10),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 8,
+        mainAxisSpacing: 8,
+        childAspectRatio: 0.78,
+      ),
+      itemCount: tiles.length,
+      itemBuilder: (_, index) => tiles[index],
+    );
+  }
+
+  Widget _videoTile(String nick, rtc.RTCVideoRenderer renderer,
+      {bool local = false, CallParticipant? participant}) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          ColoredBox(
+            color: Colors.black,
+            child: rtc.RTCVideoView(
+              renderer,
+              mirror: local,
+              objectFit: rtc.RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+            ),
+          ),
+          Positioned(
+            left: 8,
+            right: 8,
+            bottom: 8,
+            child: Text(
+              local ? '$nick (you)' : nick,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                shadows: [Shadow(blurRadius: 4, color: Colors.black)],
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          if (!local &&
+              participant != null &&
+              _canManageParticipant(participant))
+            Positioned(
+              top: 4,
+              right: 4,
+              child: Material(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(20),
+                child: PopupMenuButton<String>(
+                  iconColor: Colors.white,
+                  onSelected: (action) =>
+                      unawaited(_moderate(participant, action)),
+                  itemBuilder: (_) => [
+                    PopupMenuItem(
+                      value: 'mute',
+                      child: Text(participant.muted ? 'Unmute' : 'Mute'),
+                    ),
+                    if (_room?.video == true)
+                      PopupMenuItem(
+                        value: 'camera',
+                        child: Text(participant.cameraOff
+                            ? 'Allow camera'
+                            : 'Disable camera'),
+                      ),
+                    const PopupMenuItem(
+                      value: 'kick',
+                      child: Text('Remove from call'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (!local && participant?.muted == true)
+            const Positioned(
+              left: 8,
+              top: 8,
+              child: Icon(Icons.mic_off, color: Colors.white),
+            ),
+          if (!local && participant?.cameraOff == true)
+            const Positioned(
+              left: 36,
+              top: 8,
+              child: Icon(Icons.videocam_off, color: Colors.white),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _participantTile(CallParticipant participant, {required bool video}) {
+    var scheme = Theme.of(context).colorScheme;
+    var self = participant.client == _clientId;
+    return Material(
+      color: scheme.surfaceContainer,
+      borderRadius: BorderRadius.circular(12),
+      child: ListTile(
+        leading: CircleAvatar(
+          child: Icon(participant.muted ? Icons.mic_off : Icons.person),
+        ),
+        title: Text(self ? '${participant.nick} (you)' : participant.nick),
+        subtitle: Text(_roleLabel(participant.role)),
+        trailing: _canManageParticipant(participant)
+            ? PopupMenuButton<String>(
+                onSelected: (action) =>
+                    unawaited(_moderate(participant, action)),
+                itemBuilder: (_) => [
+                  PopupMenuItem(
+                    value: 'mute',
+                    child: Text(participant.muted ? 'Unmute' : 'Mute'),
+                  ),
+                  if (_room?.video == true)
+                    PopupMenuItem(
+                      value: 'camera',
+                      child: Text(participant.cameraOff
+                          ? 'Allow camera'
+                          : 'Disable camera'),
+                    ),
+                  const PopupMenuItem(
+                    value: 'kick',
+                    child: Text('Remove from call'),
+                  ),
+                ],
+              )
+            : Icon(
+                participant.muted ? Icons.mic_off : Icons.graphic_eq,
+                color:
+                    participant.muted ? scheme.error : scheme.onSurfaceVariant,
+              ),
+      ),
+    );
+  }
+
+  String _roleLabel(String role) {
+    switch (role) {
+      case 'creator':
+        return 'Call creator';
+      case 'channel_operator':
+        return 'Channel operator';
+      case 'irc_operator':
+        return 'IRC operator';
+      default:
+        return 'Participant';
+    }
+  }
+}
+
+class _ChannelPeer {
+  final rtc.RTCPeerConnection connection;
+  final rtc.RTCVideoRenderer renderer;
+  final List<rtc.RTCIceCandidate> pendingCandidates = [];
+  bool makingOffer = false;
+  bool waitingForAnswer = false;
+
+  _ChannelPeer(this.connection, this.renderer);
+}
+
+class _InviteUserDialog extends StatefulWidget {
+  final Client client;
+  final String channel;
+  final String selfNick;
+  final Map<String, String> initialMembers;
+  final Set<String> Function() connectedNicks;
+
+  const _InviteUserDialog({
+    required this.client,
+    required this.channel,
+    required this.selfNick,
+    required this.initialMembers,
+    required this.connectedNicks,
+  });
+
+  @override
+  State<_InviteUserDialog> createState() => _InviteUserDialogState();
+}
+
+class _InviteUserDialogState extends State<_InviteUserDialog> {
+  Timer? _timer;
+  bool _loading = false;
+  late List<_InviteCandidate> _candidates;
+
+  @override
+  void initState() {
+    super.initState();
+    _setCandidates(widget.initialMembers);
+    unawaited(_refresh());
+    _timer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_refresh()),
+    );
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _setCandidates(Map<String, String> members) {
+    var connected = widget.connectedNicks();
+    var byLower = <String, _InviteCandidate>{};
+    for (var entry in members.entries) {
+      var nick = entry.key.trim();
+      var lower = nick.toLowerCase();
+      if (nick.isEmpty ||
+          lower == widget.selfNick.toLowerCase() ||
+          connected.contains(lower)) {
+        continue;
+      }
+      byLower[lower] = _InviteCandidate(nick: nick, prefix: entry.value);
+    }
+    _candidates = byLower.values.toList()..sort(_compareInviteCandidates);
+  }
+
+  Future<void> _refresh() async {
+    if (_loading) return;
+    _loading = true;
+    try {
+      var names = await widget.client.names(widget.channel);
+      if (!mounted) return;
+      setState(() => _setCandidates({
+            for (var member in names.members) member.nickname: member.prefix,
+          }));
+    } on Exception {
+      // Keep the last known list while the IRC connection is recovering.
+    } finally {
+      _loading = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Invite to call'),
+      content: SizedBox(
+        width: 320,
+        height: min(360, max(64, _candidates.length * 48)).toDouble(),
+        child: _candidates.isEmpty
+            ? Center(
+                child: Text(
+                  _loading ? 'Refreshing user list...' : 'No users to invite',
+                ),
+              )
+            : ListView.builder(
+                itemCount: _candidates.length,
+                itemBuilder: (context, index) {
+                  var nick = _candidates[index];
+                  return ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.person_add_alt_1),
+                    title: Text(nick.nick),
+                    onTap: () => Navigator.pop(context, nick.nick),
+                  );
+                },
+              ),
+      ),
+    );
+  }
+}
+
+class _InviteCandidate {
+  final String nick;
+  final String prefix;
+
+  const _InviteCandidate({required this.nick, required this.prefix});
+}
+
+int _compareInviteCandidates(_InviteCandidate a, _InviteCandidate b) {
+  var rank = _inviteMembershipRank(a.prefix) - _inviteMembershipRank(b.prefix);
+  if (rank != 0) {
+    return rank;
+  }
+  return a.nick.toLowerCase().compareTo(b.nick.toLowerCase());
+}
+
+int _inviteMembershipRank(String prefix) {
+  const privilegeOrder = '!~&@%+';
+  var best = privilegeOrder.length;
+  for (var ch in prefix.split('')) {
+    var index = privilegeOrder.indexOf(ch);
+    if (index >= 0 && index < best) {
+      best = index;
+    }
+  }
+  return best;
+}

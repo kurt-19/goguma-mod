@@ -1,0 +1,378 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:html/dom.dart' as htmldom;
+import 'package:html/parser.dart' as html;
+import 'package:linkify/linkify.dart' as lnk;
+
+import 'database.dart';
+import 'linkify.dart';
+import 'logging.dart';
+
+const maxPhotoSize = 10 * 1024 * 1024;
+const maxAudioSize = 10 * 1024 * 1024;
+const maxVideoSize = 50 * 1024 * 1024;
+const maxHtmlSize = 2 * 1024 * 1024;
+const minPeekHtmlSize = 50 * 1024;
+const maxPeekHtmlSize = 500 * 1024;
+const minImageDimensions = 250;
+const minImageSize = 20 * 1024;
+
+class LinkPreviewer {
+	final HttpClient _client = HttpClient();
+	final DB _db;
+	final Map<String, Future<LinkPreview?>> _pending = {};
+	final Map<String, LinkPreview?> _cached = {};
+
+	LinkPreviewer(DB db) : _db = db;
+
+	void dispose() {
+		_client.close();
+	}
+
+	bool _validateUrl(Uri url) {
+		return url.scheme == 'https' && !url.host.isEmpty;
+	}
+
+	bool _validateUrlStr(String str) {
+		var url = Uri.tryParse(str);
+		return url != null && _validateUrl(url);
+	}
+
+	String? _findOpenGraph(htmldom.Document doc, String name) {
+		var elem = doc.head?.querySelector('meta[property="$name"]');
+		return elem?.attributes['content'];
+	}
+
+	int? _findOpenGraphInt(htmldom.Document doc, String name) {
+		var value = _findOpenGraph(doc, name);
+		if (value == null) {
+			return null;
+		}
+		// Some websites use floating-point numbers instead of integers...
+		return double.tryParse(value)?.round();
+	}
+
+	bool _findBodyTag(List<int> buf) {
+		var pattern = '<body';
+		var offset = 0;
+		for (var byte in buf) {
+			var ch = String.fromCharCode(byte);
+			if (offset == pattern.length) {
+				if (ch == '>' || ch == ' ') {
+					return true;
+				}
+				offset = 0;
+			}
+			if (ch.toLowerCase() == pattern[offset]) {
+				offset++;
+			} else {
+				offset = 0;
+			}
+		}
+		return false;
+	}
+
+	Future<LinkPreviewEntry> _fetchHtmlPreview(Uri url, LinkPreviewEntry entry, bool reqRange) async {
+		var req = await _client.getUrl(url);
+		if (reqRange) {
+			req.headers.set('Range', 'bytes=0-${maxPeekHtmlSize-1}');
+		}
+		var resp = await req.close();
+		if (resp.statusCode ~/ 100 != 2) {
+			throw Exception('HTTP error fetching $url: ${resp.statusCode}');
+		}
+
+		// Continue reading the response body until we find a <body> tag. Some
+		// web pages (e.g. YouTube) have OpenGraph metadata at the end of the
+		// <head> and require us to read 500KiB.
+		var peekSize = minPeekHtmlSize;
+		var bytesBuilder = BytesBuilder(copy: false);
+		await for (var chunk in resp) {
+			bytesBuilder.add(chunk);
+
+			if (bytesBuilder.length < peekSize) {
+				continue;
+			}
+
+			if (_findBodyTag(bytesBuilder.toBytes())) {
+				break;
+			}
+
+			if (peekSize >= maxPeekHtmlSize) {
+				break;
+			}
+			peekSize *= 2;
+			if (peekSize > maxPeekHtmlSize) {
+				peekSize = maxPeekHtmlSize;
+			}
+		}
+		// TODO: find a way to discard the rest of the response?
+		htmldom.Document doc;
+		try {
+			doc = html.parse(bytesBuilder.toBytes());
+		} on ArgumentError catch (err) {
+			// Can happen on unsupported charset
+			throw Exception('Failed to parse HTML: $err');
+		}
+
+		// TODO: add support for oEmbed, see https://oembed.com/
+		// TODO: handle og:audio
+
+		// OpenGraph, see https://ogp.me/
+		var ogImage = _findOpenGraph(doc, 'og:image');
+		if (ogImage == null || !_validateUrlStr(ogImage)) {
+			return entry;
+		}
+
+		var ogImageWidth = _findOpenGraphInt(doc, 'og:image:width');
+		var ogImageHeight = _findOpenGraphInt(doc, 'og:image:height');
+		if (ogImageWidth != null && ogImageHeight != null) {
+			if (ogImageWidth >= minImageDimensions && ogImageHeight >= minImageDimensions) {
+				entry.imageUrl = ogImage;
+			}
+			return entry;
+		}
+
+		// No embedded image dimensions; fetch to see size. Larger than 20kB means larger than 256x256.
+		var imageReq = await _client.headUrl(Uri.parse(ogImage));
+		var imageResp = await imageReq.close();
+		if (imageResp.statusCode ~/ 100 != 2) {
+			return entry;
+		}
+		if (imageResp.headers.contentLength > minImageSize) {
+			entry.imageUrl = ogImage;
+		}
+		return entry;
+	}
+
+	Future<LinkPreviewEntry?> _fetchPreview(Uri url) async {
+		if (!_validateUrl(url)) {
+			return null;
+		}
+
+		HttpClientResponse resp;
+		var usedPeekGet = false;
+		try {
+			var req = await _client.headUrl(url);
+			resp = await req.close();
+			if (resp.statusCode ~/ 100 != 2) {
+				throw Exception('HTTP error fetching $url: ${resp.statusCode}');
+			}
+		} on Exception {
+			var req = await _client.getUrl(url);
+			req.headers.set('Range', 'bytes=0-0');
+			resp = await req.close();
+			usedPeekGet = true;
+			if (resp.statusCode ~/ 100 != 2) {
+				throw Exception('HTTP error fetching $url: ${resp.statusCode}');
+			}
+		}
+
+		var entry = LinkPreviewEntry(
+			url: url.toString(),
+			statusCode: resp.statusCode,
+			mimeType: resp.headers.contentType?.mimeType,
+			contentLength: resp.headers.contentLength > 0 ? resp.headers.contentLength : null,
+		);
+
+		if (!usedPeekGet && resp.headers.contentType?.mimeType == 'text/html') {
+			var acceptsByteRanges = resp.headers.value('Accept-Ranges') == 'bytes';
+			var useByteRanges = resp.headers.contentLength > maxPeekHtmlSize && acceptsByteRanges;
+			if (useByteRanges || resp.headers.contentLength < maxHtmlSize) {
+				return await _fetchHtmlPreview(url, entry, useByteRanges);
+			}
+		}
+
+		if (usedPeekGet) {
+			unawaited(resp.drain<void>());
+		}
+		return entry;
+	}
+
+	Future<LinkPreview?> _previewUrl(Uri url) async {
+		var entry = await _db.fetchLinkPreview(url.toString());
+		if (entry != null) {
+			return LinkPreview._fromEntry(entry);
+		}
+
+		try {
+			entry = await _fetchPreview(url);
+		} on Exception catch (err) {
+			log.print('Failed to fetch link preview for <$url>', error: err);
+		} on ArgumentError catch (err) {
+			// TODO: drop once this is resolved:
+			// https://github.com/dart-lang/sdk/issues/60867
+			log.print('Failed to fetch link preview for <$url>', error: err);
+		}
+		if (entry == null) {
+			return null;
+		}
+
+		await _db.storeLinkPreview(entry);
+		return LinkPreview._fromEntry(entry);
+	}
+
+	Future<LinkPreview?> previewUrl(Uri url) async {
+		var k = url.toString();
+		var direct = LinkPreview._fromUrl(url);
+		if (direct != null) {
+			_cached[k] = direct;
+			return direct;
+		}
+
+		if (_cached.containsKey(k)) {
+			return _cached[k];
+		}
+
+		var pending = _pending[k];
+		if (pending != null) {
+			return await pending;
+		}
+
+		var future = _previewUrl(url);
+		_pending[k] = future;
+		LinkPreview? preview;
+		try {
+			preview = await future;
+		} finally {
+			unawaited(_pending.remove(k));
+		}
+
+		_cached[k] = preview;
+		return preview;
+	}
+
+	Future<List<LinkPreview>> previewText(String text) async {
+		var links = extractLinks(text);
+
+		List<LinkPreview> previews = [];
+		await Future.wait(links.map((link) async {
+			if (link is lnk.UrlElement) {
+				var url = Uri.parse(link.url);
+				var preview = LinkPreview._fromUrl(url) ?? await previewUrl(url);
+				if (preview != null) {
+					previews.add(preview);
+				}
+			}
+		}));
+
+		return previews;
+	}
+
+	List<LinkPreview>? cachedPreviewText(String text) {
+		var links = extractLinks(text);
+
+		List<LinkPreview> previews = [];
+		for (var link in links) {
+			if (!(link is lnk.UrlElement)) {
+				continue;
+			}
+			var direct = LinkPreview._fromUrl(Uri.parse(link.url));
+			if (direct != null) {
+				_cached[link.url] = direct;
+				previews.add(direct);
+				continue;
+			}
+			if (!_cached.containsKey(link.url)) {
+				return null;
+			}
+			var preview = _cached[link.url];
+			if (preview != null) {
+				previews.add(preview);
+			}
+		}
+
+		return previews;
+	}
+}
+
+abstract class LinkPreview {
+	final Uri url;
+
+	Uri? get imageUrl => null;
+	Uri? get audioUrl => null;
+	Uri? get videoUrl => null;
+
+	LinkPreview._(this.url);
+
+	static LinkPreview? _fromUrl(Uri url) {
+		return _fromEntry(LinkPreviewEntry(url: url.toString()));
+	}
+
+	static LinkPreview? _fromEntry(LinkPreviewEntry entry) {
+		var mimeType = entry.mimeType ?? _mimeTypeFromUrl(entry.url);
+		if (mimeType == null) {
+			return null;
+		}
+
+		var url = Uri.parse(entry.url);
+		if (mimeType.startsWith('image/')) {
+			if (entry.contentLength != null && entry.contentLength! > maxPhotoSize) {
+				return null;
+			}
+			return PhotoPreview(url);
+		} else if (mimeType.startsWith('audio/')) {
+			if (entry.contentLength != null && entry.contentLength! > maxAudioSize) {
+				return null;
+			}
+			return AudioPreview(url);
+		} else if (mimeType.startsWith('video/')) {
+			if (entry.contentLength != null && entry.contentLength! > maxVideoSize) {
+				return null;
+			}
+			return VideoPreview(url);
+		} else if (entry.imageUrl != null) {
+			return PagePreview(url, Uri.parse(entry.imageUrl!));
+		} else {
+			return null;
+		}
+	}
+}
+
+String? _mimeTypeFromUrl(String value) {
+	var uri = Uri.tryParse(value);
+	var path = uri?.path.toLowerCase() ?? value.toLowerCase();
+	if (path.endsWith('.jpg') || path.endsWith('.jpeg')) return 'image/jpeg';
+	if (path.endsWith('.png')) return 'image/png';
+	if (path.endsWith('.gif')) return 'image/gif';
+	if (path.endsWith('.webp')) return 'image/webp';
+	if (path.endsWith('.mp4')) return 'video/mp4';
+	if (path.endsWith('.mov')) return 'video/quicktime';
+	if (path.endsWith('.webm')) return 'video/webm';
+	if (path.endsWith('.m4a')) return 'audio/mp4';
+	if (path.endsWith('.mp3')) return 'audio/mpeg';
+	if (path.endsWith('.ogg') || path.endsWith('.oga') || path.endsWith('.opus')) return 'audio/ogg';
+	if (path.endsWith('.wav')) return 'audio/wav';
+	if (path.endsWith('.aac')) return 'audio/aac';
+	return null;
+}
+
+class PhotoPreview extends LinkPreview {
+	PhotoPreview(super.url) : super._();
+
+	@override
+	Uri get imageUrl => url;
+}
+
+class AudioPreview extends LinkPreview {
+	AudioPreview(super.url) : super._();
+
+	@override
+	Uri? get audioUrl => url;
+}
+
+class VideoPreview extends LinkPreview {
+	VideoPreview(super.url) : super._();
+
+	@override
+	Uri? get videoUrl => url;
+}
+
+class PagePreview extends LinkPreview {
+	@override
+	final Uri imageUrl;
+
+	PagePreview(super.url, this.imageUrl) : super._();
+}

@@ -1,0 +1,21 @@
+IRC mobile is a modified app based on the Goguma IRC mobile app.
+
+Upstream Goguma source:
+https://codeberg.org/emersion/goguma
+
+License:
+GNU Affero General Public License v3.0 with the upstream Goguma application
+store exception.
+
+License text:
+The AGPLv3 license text is included in the app source repository as LICENSE.
+
+Attribution:
+Goguma copyright notice: Copyright (C) 2021 The goguma Contributors.
+
+Store distribution note:
+Upstream Goguma grants an additional permission under AGPLv3 section 7 allowing
+distribution through an application store, even if that store has restrictive
+terms and conditions incompatible with the AGPL, provided the source is also
+available under the AGPL with or without this permission through a channel
+without those restrictive terms and conditions.

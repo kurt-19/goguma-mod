@@ -1,0 +1,886 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_webrtc/flutter_webrtc.dart' as rtc;
+
+import '../client.dart';
+import '../irc/irc.dart';
+import '../profile_backend.dart';
+
+const _callAudioChannel = MethodChannel('com.ircmobile.app/activity');
+
+class CallPageArguments {
+  final String roomUrl;
+  final String? target;
+  final bool? video;
+  final bool autoJoin;
+  final bool outgoing;
+  final bool channel;
+  final String? nick;
+  final String role;
+  final String controlToken;
+  final List<String> channelMembers;
+  final Map<String, String> channelMemberPrefixes;
+  final Client? client;
+  final String? returnRouteName;
+  final Object? returnRouteArguments;
+
+  const CallPageArguments({
+    required this.roomUrl,
+    this.target,
+    this.video,
+    this.autoJoin = true,
+    this.outgoing = false,
+    this.channel = false,
+    this.nick,
+    this.role = 'member',
+    this.controlToken = '',
+    this.channelMembers = const [],
+    this.channelMemberPrefixes = const {},
+    this.client,
+    this.returnRouteName,
+    this.returnRouteArguments,
+  });
+
+  static CallPageArguments? tryParse(
+    String url, {
+    String? target,
+    bool? video,
+    bool channel = false,
+    String? nick,
+    String role = 'member',
+    String controlToken = '',
+    List<String> channelMembers = const [],
+    Map<String, String> channelMemberPrefixes = const {},
+    Client? client,
+    String? returnRouteName,
+    Object? returnRouteArguments,
+  }) {
+    var roomId = callRoomIdFromUrl(url);
+    if (roomId == null) {
+      return null;
+    }
+    var uri = Uri.tryParse(url);
+    var channelTarget = uri?.queryParameters['channel']?.trim() ?? '';
+    var isChannel = channel || channelTarget.isNotEmpty;
+    var queryVideo = uri?.queryParameters['video'];
+    return CallPageArguments(
+      roomUrl: url,
+      target: channelTarget.isNotEmpty ? channelTarget : target,
+      video: video ?? (queryVideo == null ? null : queryVideo == '1'),
+      channel: isChannel,
+      nick: nick,
+      role: role,
+      controlToken: controlToken,
+      channelMembers: channelMembers,
+      channelMemberPrefixes: channelMemberPrefixes,
+      client: client,
+      returnRouteName: returnRouteName,
+      returnRouteArguments: returnRouteArguments,
+    );
+  }
+}
+
+class CallPage extends StatefulWidget {
+  static const routeName = '/call';
+
+  final CallPageArguments args;
+
+  const CallPage({required this.args, super.key});
+
+  @override
+  State<CallPage> createState() => _CallPageState();
+}
+
+class ActiveCallInfo {
+  final CallPageArguments args;
+
+  const ActiveCallInfo(this.args);
+
+  String get roomUrl => args.roomUrl;
+  String get target => args.target ?? '';
+  bool get video => args.video ?? false;
+  bool get channel => args.channel;
+}
+
+final activeCallInfo = ValueNotifier<ActiveCallInfo?>(null);
+
+class _CallPageState extends State<CallPage> {
+  final _backend = const ProfileBackendClient();
+  final _localRenderer = rtc.RTCVideoRenderer();
+  final _remoteRenderer = rtc.RTCVideoRenderer();
+  late final String _roomId;
+  late final String _clientId;
+
+  CallRoom? _room;
+  rtc.MediaStream? _localStream;
+  rtc.RTCPeerConnection? _peer;
+  Timer? _pollTimer;
+  String? _remoteClientId;
+  bool _joined = false;
+  bool _polling = false;
+  bool _pollInFlight = false;
+  bool _makingOffer = false;
+  bool _waitingForAnswer = false;
+  bool _connectionEstablished = false;
+  bool _muted = false;
+  bool _cameraOff = false;
+  bool _speakerOn = false;
+  bool _ending = false;
+  bool _allowPop = false;
+  int _lastSeq = 0;
+  String _status = 'ready';
+  final List<rtc.RTCIceCandidate> _pendingCandidates = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _roomId = callRoomIdFromUrl(widget.args.roomUrl) ?? '';
+    _clientId = _randomClientId();
+    _init();
+  }
+
+  Future<void> _init() async {
+    await _localRenderer.initialize();
+    await _remoteRenderer.initialize();
+    try {
+      var result = await _backend.pollCallEvents(
+        roomId: _roomId,
+        clientId: _clientId,
+        after: 0,
+      );
+      if (!mounted) return;
+      setState(() {
+        _room = result.room;
+        _lastSeq = 0;
+        _status = 'Ready';
+      });
+      if (widget.args.autoJoin) {
+        await _join();
+      }
+    } on Exception catch (err) {
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    }
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    if (_joined) {
+      unawaited(_postEvent('leave', {}));
+    }
+    _clearActiveCall();
+    _closeLocal();
+    _localRenderer.dispose();
+    _remoteRenderer.dispose();
+    super.dispose();
+  }
+
+  String _randomClientId() {
+    const chars =
+        'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-';
+    var random = Random.secure();
+    return List.generate(24, (_) => chars[random.nextInt(chars.length)]).join();
+  }
+
+  Future<void> _join() async {
+    var room = _room;
+    if (room == null || _joined) return;
+
+    try {
+      setState(() => _status = 'Joining call...');
+      await _postEvent('join', {
+        'mode': room.mode,
+        'nick': widget.args.nick ?? widget.args.client?.nick ?? '',
+        'role': widget.args.role,
+        'controlToken': widget.args.controlToken,
+      });
+      _joined = true;
+      setState(() => _status = 'Opening microphone...');
+      var audioConstraints = Platform.isAndroid
+          ? <String, dynamic>{
+              'mandatory': <String, dynamic>{},
+              'optional': <Map<String, dynamic>>[
+                {'googEchoCancellation': true},
+                {'echoCancellation': true},
+                {'googEchoCancellation2': true},
+                {'googDAEchoCancellation': true},
+                {'googNoiseSuppression': true},
+                {'googNoiseSuppression2': true},
+                {'googHighpassFilter': true},
+                // AGC can pump quiet room noise between spoken words.
+                {'googAutoGainControl': false},
+                {'googAutoGainControl2': false},
+                {'googTypingNoiseDetection': true},
+              ],
+            }
+          : <String, dynamic>{
+              'echoCancellation': true,
+              'noiseSuppression': true,
+              'autoGainControl': false,
+            };
+      var stream = await rtc.navigator.mediaDevices.getUserMedia({
+        // Android's flutter_webrtc parser expects mandatory/optional groups.
+        // Keep AGC off so it does not amplify low-level room noise.
+        'audio': audioConstraints,
+        'video': room.video
+            ? {
+                'facingMode': 'user',
+              }
+            : false,
+      });
+      _localStream = stream;
+      _localRenderer.srcObject = stream;
+      _rememberActiveCall();
+
+      // Start both voice and video calls on the earpiece. Users can enable the
+      // speaker explicitly; this avoids acoustic feedback when two phones are
+      // close to each other.
+      _speakerOn = false;
+      await _applySpeakerRoute();
+      await _updateProximity();
+
+      var peer = await rtc.createPeerConnection({
+        'iceServers': room.iceServers.isEmpty
+            ? [
+                {'urls': 'stun:stun.l.google.com:19302'}
+              ]
+            : room.iceServers,
+      });
+      _peer = peer;
+
+      peer.onIceCandidate = (candidate) {
+        unawaited(_postEvent('candidate', {
+          'candidate': candidate.candidate,
+          'sdpMid': candidate.sdpMid,
+          'sdpMLineIndex': candidate.sdpMLineIndex,
+        }));
+      };
+      peer.onTrack = (event) {
+        if (event.streams.isNotEmpty) {
+          _remoteRenderer.srcObject = event.streams.first;
+        }
+        _markConnected();
+      };
+      peer.onConnectionState = (state) {
+        if (!mounted) return;
+        var stateName = state.toString();
+        if (stateName.endsWith('Connected')) {
+          _markConnected();
+        } else if (stateName.endsWith('Connecting')) {
+          // WebRTC often reports Connecting for a few seconds even after the
+          // remote side has accepted and media negotiation has started. Do not
+          // keep the UI looking stuck on small devices; mark it connected as
+          // soon as the peer is actively negotiating.
+          _markConnected();
+        } else if (stateName.endsWith('Failed')) {
+          setState(() => _status = 'Connection failed');
+        } else if (stateName.endsWith('Disconnected')) {
+          setState(() => _status = 'Disconnected');
+        }
+      };
+
+      for (var track in stream.getTracks()) {
+        await peer.addTrack(track, stream);
+      }
+
+      _connectionEstablished = false;
+      _lastSeq = 0;
+      setState(() => _status = 'Calling...');
+      unawaited(_startRingback());
+      _startPolling();
+      unawaited(_pollEvents());
+    } on Exception catch (err) {
+      unawaited(_stopRingback());
+      if (_joined) {
+        try {
+          await _postEvent('leave', {
+            'nick': widget.args.nick ?? widget.args.client?.nick ?? '',
+          });
+        } on Exception {
+          // The failed local join still needs cleanup.
+        }
+      }
+      _joined = false;
+      _closeLocal();
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    }
+  }
+
+  Future<void> _startRingback() async {
+    if (!widget.args.outgoing || !_joined || _connectionEstablished) {
+      return;
+    }
+    try {
+      await _callAudioChannel.invokeMethod<void>('startCallRingback');
+    } on Exception {
+      // The call itself must continue if the ringback sound cannot be played.
+    }
+  }
+
+  Future<void> _stopRingback() async {
+    try {
+      await _callAudioChannel.invokeMethod<void>('stopCallRingback');
+    } on Exception {
+      // Ignore audio cleanup errors.
+    }
+  }
+
+  void _startPolling() {
+    if (_polling) return;
+    _polling = true;
+    _pollTimer = Timer.periodic(Duration(milliseconds: 350), (_) {
+      unawaited(_pollEvents());
+    });
+    unawaited(_pollEvents());
+  }
+
+  Future<void> _pollEvents() async {
+    if (!_polling || _pollInFlight) return;
+    _pollInFlight = true;
+    try {
+      var result = await _backend.pollCallEvents(
+        roomId: _roomId,
+        clientId: _clientId,
+        after: _lastSeq,
+      );
+      _lastSeq = result.nextSeq;
+      if (mounted && _room == null) {
+        setState(() => _room = result.room);
+      }
+      for (var event in result.events) {
+        await _handleEvent(event);
+      }
+    } on Exception catch (err) {
+      if (!mounted) return;
+      setState(() => _status = err.toString());
+    } finally {
+      _pollInFlight = false;
+    }
+  }
+
+  Future<void> _handleEvent(CallEvent event) async {
+    var peer = _peer;
+    if (peer == null || event.client == _clientId) return;
+
+    if (_remoteClientId == null && event.client != 'server') {
+      _remoteClientId = event.client;
+    }
+    if (event.client != 'server' && event.client != _remoteClientId) {
+      return;
+    }
+
+    switch (event.type) {
+      case 'join':
+        if (_clientId.compareTo(event.client) < 0) {
+          await _makeOffer();
+        }
+        break;
+      case 'offer':
+        await peer.setRemoteDescription(_descriptionFromPayload(event.payload));
+        await _flushPendingCandidates();
+        var answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        await _postEvent('answer', _descriptionToPayload(answer));
+        _markConnected();
+        break;
+      case 'answer':
+        if (_waitingForAnswer) {
+          await peer
+              .setRemoteDescription(_descriptionFromPayload(event.payload));
+          _waitingForAnswer = false;
+          await _flushPendingCandidates();
+          _markConnected();
+        }
+        break;
+      case 'candidate':
+        var candidate = _candidateFromPayload(event.payload);
+        var remoteDescription = await peer.getRemoteDescription();
+        if (remoteDescription == null) {
+          _pendingCandidates.add(candidate);
+        } else {
+          await peer.addCandidate(candidate);
+        }
+        break;
+      case 'leave':
+        try {
+          await _postEvent('leave', {});
+        } on Exception {
+          // The remote side already left; continue local cleanup.
+        }
+        _hangUpLocally('The other side left');
+        _returnToChat();
+        break;
+      case 'decline':
+        if (_connectionEstablished) {
+          break;
+        }
+        try {
+          await _postEvent('leave', {});
+        } on Exception {
+          // The remote side declined; continue local cleanup.
+        }
+        _hangUpLocally('Call declined');
+        _returnToChat();
+        break;
+    }
+  }
+
+  Future<void> _makeOffer() async {
+    var peer = _peer;
+    if (peer == null || _makingOffer || _waitingForAnswer) return;
+
+    _makingOffer = true;
+    try {
+      var offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      _waitingForAnswer = true;
+      await _postEvent('offer', _descriptionToPayload(offer));
+      if (mounted && !_connectionEstablished) {
+        setState(() => _status = 'Calling...');
+      }
+    } finally {
+      _makingOffer = false;
+    }
+  }
+
+  void _markConnected() {
+    if (!mounted || _connectionEstablished) return;
+    unawaited(_stopRingback());
+    setState(() {
+      _connectionEstablished = true;
+      _status = 'Connected';
+    });
+  }
+
+  Future<void> _flushPendingCandidates() async {
+    var peer = _peer;
+    if (peer == null) return;
+
+    while (_pendingCandidates.isNotEmpty) {
+      await peer.addCandidate(_pendingCandidates.removeAt(0));
+    }
+  }
+
+  rtc.RTCSessionDescription _descriptionFromPayload(
+      Map<String, dynamic> payload) {
+    return rtc.RTCSessionDescription(
+      payload['sdp'] as String? ?? '',
+      payload['type'] as String? ?? '',
+    );
+  }
+
+  Map<String, dynamic> _descriptionToPayload(
+      rtc.RTCSessionDescription description) {
+    return {
+      'sdp': description.sdp,
+      'type': description.type,
+    };
+  }
+
+  rtc.RTCIceCandidate _candidateFromPayload(Map<String, dynamic> payload) {
+    return rtc.RTCIceCandidate(
+      payload['candidate'] as String?,
+      payload['sdpMid'] as String?,
+      payload['sdpMLineIndex'] as int?,
+    );
+  }
+
+  Future<void> _postEvent(String type, Map<String, dynamic> payload) {
+    return _backend.postCallEvent(
+      roomId: _roomId,
+      clientId: _clientId,
+      type: type,
+      payload: payload,
+    );
+  }
+
+  void _toggleMute() {
+    var stream = _localStream;
+    if (stream == null) return;
+    var muted = !_muted;
+    for (var track in stream.getAudioTracks()) {
+      track.enabled = !muted;
+    }
+    setState(() => _muted = muted);
+  }
+
+  void _toggleCamera() {
+    var stream = _localStream;
+    if (stream == null) return;
+    var cameraOff = !_cameraOff;
+    for (var track in stream.getVideoTracks()) {
+      track.enabled = !cameraOff;
+    }
+    setState(() => _cameraOff = cameraOff);
+  }
+
+  Future<void> _applySpeakerRoute() async {
+    try {
+      await rtc.Helper.setSpeakerphoneOn(_speakerOn);
+    } on Exception {
+      // Some platforms/devices may reject manual audio routing. Keep the call
+      // alive even when routing cannot be changed.
+    }
+  }
+
+  Future<void> _resetAudioRoute() async {
+    await _setProximity(false);
+    try {
+      await rtc.Helper.setSpeakerphoneOn(false);
+    } on Exception {
+      // Ignore.
+    }
+    if (Platform.isAndroid) {
+      try {
+        await rtc.Helper.clearAndroidCommunicationDevice();
+      } on Exception {
+        // Ignore.
+      }
+      try {
+        await _callAudioChannel.invokeMethod<void>('clearCallAudioRoute');
+      } on Exception {
+        // Ignore.
+      }
+    }
+  }
+
+  Future<void> _toggleSpeakerRoute() async {
+    if (!_joined) return;
+    setState(() => _speakerOn = !_speakerOn);
+    await _applySpeakerRoute();
+    await _updateProximity();
+  }
+
+  Future<void> _setProximity(bool enabled) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _callAudioChannel
+          .invokeMethod<void>('setCallProximity', {'enabled': enabled});
+    } on Exception {
+      // Proximity support differs between Android devices.
+    }
+  }
+
+  Future<void> _updateProximity() {
+    var isVideo = _room?.video ?? widget.args.video ?? false;
+    return _setProximity(_joined && !isVideo && !_speakerOn);
+  }
+
+  Future<void> _hangUp() async {
+    if (_ending) return;
+    _ending = true;
+    if (_joined) {
+      try {
+        await _postEvent('leave', {});
+      } on Exception {
+        // Local cleanup must still complete if signaling is unavailable.
+      }
+    }
+    unawaited(_sendCallEndMessage());
+    _hangUpLocally('Call ended');
+    _returnToChat();
+  }
+
+  void _openApp() {
+    if (!mounted) return;
+    var routeName = widget.args.returnRouteName ?? '/';
+    Navigator.of(context).pushNamed(
+      routeName,
+      arguments: widget.args.returnRouteArguments,
+    );
+  }
+
+  void _rememberActiveCall() {
+    activeCallInfo.value = ActiveCallInfo(widget.args);
+  }
+
+  void _clearActiveCall() {
+    var active = activeCallInfo.value;
+    if (active != null && active.roomUrl == widget.args.roomUrl) {
+      activeCallInfo.value = null;
+    }
+  }
+
+  Future<void> _sendCallEndMessage() async {
+    var client = widget.args.client;
+    var target = widget.args.target ?? _room?.target ?? '';
+    if (client == null || target.isEmpty) {
+      return;
+    }
+
+    var isVideo = _room?.video ?? widget.args.video ?? false;
+    var text = isVideo ? 'video call end' : 'voice call end';
+    try {
+      await client.sendTextMessage(IrcMessage('PRIVMSG', [target, text]));
+    } on Exception {
+      // The local hangup should not be blocked by an IRC send failure.
+    }
+  }
+
+  void _returnToChat() {
+    if (mounted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && (ModalRoute.of(context)?.isCurrent ?? true)) {
+          unawaited(Navigator.of(context).maybePop());
+        }
+      });
+    }
+  }
+
+  void _hangUpLocally(String status) {
+    _clearActiveCall();
+    unawaited(_stopRingback());
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    _polling = false;
+    _joined = false;
+    _ending = false;
+    _waitingForAnswer = false;
+    _connectionEstablished = false;
+    _remoteClientId = null;
+    _pendingCandidates.clear();
+    _closeLocal();
+    if (mounted) {
+      setState(() {
+        _status = status;
+        _allowPop = true;
+      });
+    }
+  }
+
+  void _closeLocal() {
+    unawaited(_stopRingback());
+    _peer?.close();
+    _peer = null;
+    _localStream?.getTracks().forEach((track) {
+      track.stop();
+    });
+    var stream = _localStream;
+    _localStream = null;
+    _localRenderer.srcObject = null;
+    _remoteRenderer.srcObject = null;
+    if (stream != null) {
+      unawaited(() async {
+        try {
+          await stream.dispose();
+        } finally {
+          await _resetAudioRoute();
+        }
+      }());
+    } else {
+      unawaited(_resetAudioRoute());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var scheme = Theme.of(context).colorScheme;
+    var room = _room;
+    var isVideo = room?.video ?? widget.args.video ?? false;
+    var title = isVideo ? 'Video call' : 'Voice call';
+    var target = room?.target ?? widget.args.target ?? '';
+
+    return PopScope(
+      canPop: !_joined || _allowPop,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) {
+          _openApp();
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          leading: _joined
+              ? IconButton(
+                  tooltip: 'Back to app',
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: _openApp,
+                )
+              : null,
+          title: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title),
+              if (target.isNotEmpty)
+                Text(
+                  target,
+                  style: TextStyle(
+                    color: scheme.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              Expanded(
+                child: Padding(
+                  padding: EdgeInsets.all(12),
+                  child: isVideo
+                      ? _VideoCallView(
+                          localRenderer: _localRenderer,
+                          remoteRenderer: _remoteRenderer,
+                        )
+                      : _VoiceCallView(status: _status, target: target),
+                ),
+              ),
+              Padding(
+                padding: EdgeInsets.fromLTRB(16, 8, 16, 18),
+                child: Column(
+                  children: [
+                    Text(
+                      _status,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: scheme.onSurfaceVariant),
+                    ),
+                    SizedBox(height: 12),
+                    Wrap(
+                      alignment: WrapAlignment.center,
+                      runAlignment: WrapAlignment.center,
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: _joined ? _toggleMute : null,
+                          icon: Icon(_muted ? Icons.mic_off : Icons.mic),
+                          label: Text(_muted ? 'Unmute' : 'Mute'),
+                        ),
+                        FilledButton.tonalIcon(
+                          onPressed: _joined ? _toggleSpeakerRoute : null,
+                          icon: Icon(_speakerOn
+                              ? Icons.volume_up
+                              : Icons.phone_in_talk),
+                          label: Text(_speakerOn ? 'Earpiece' : 'Speaker'),
+                        ),
+                        if (isVideo)
+                          FilledButton.tonalIcon(
+                            onPressed: _joined ? _toggleCamera : null,
+                            icon: Icon(_cameraOff
+                                ? Icons.videocam_off
+                                : Icons.videocam),
+                            label:
+                                Text(_cameraOff ? 'Camera on' : 'Camera off'),
+                          ),
+                      ],
+                    ),
+                    SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton.icon(
+                        onPressed: _joined ? _hangUp : _join,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: _joined
+                              ? const Color(0xFFC62828)
+                              : scheme.primary,
+                          foregroundColor:
+                              _joined ? Colors.white : scheme.onPrimary,
+                        ),
+                        icon: Icon(_joined ? Icons.call_end : Icons.call),
+                        label: Text(_joined ? 'End Call' : 'Join Call'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _VideoCallView extends StatelessWidget {
+  final rtc.RTCVideoRenderer localRenderer;
+  final rtc.RTCVideoRenderer remoteRenderer;
+
+  const _VideoCallView({
+    required this.localRenderer,
+    required this.remoteRenderer,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        Positioned.fill(
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: ColoredBox(
+              color: Colors.black,
+              child: rtc.RTCVideoView(
+                remoteRenderer,
+                objectFit: rtc.RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              ),
+            ),
+          ),
+        ),
+        Positioned(
+          right: 12,
+          bottom: 12,
+          width: 118,
+          height: 168,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: ColoredBox(
+              color: Colors.black,
+              child: rtc.RTCVideoView(
+                localRenderer,
+                mirror: true,
+                objectFit: rtc.RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _VoiceCallView extends StatelessWidget {
+  final String status;
+  final String target;
+
+  const _VoiceCallView({required this.status, required this.target});
+
+  @override
+  Widget build(BuildContext context) {
+    var scheme = Theme.of(context).colorScheme;
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 112,
+            height: 112,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: scheme.surfaceContainerHigh,
+              shape: BoxShape.circle,
+            ),
+            child: Icon(Icons.call, size: 48, color: scheme.primary),
+          ),
+          SizedBox(height: 18),
+          Text(
+            target.isEmpty ? 'Voice call' : target,
+            style: Theme.of(context).textTheme.headlineSmall,
+            textAlign: TextAlign.center,
+          ),
+          SizedBox(height: 8),
+          Text(
+            status,
+            style: TextStyle(color: scheme.onSurfaceVariant),
+            textAlign: TextAlign.center,
+          ),
+        ],
+      ),
+    );
+  }
+}

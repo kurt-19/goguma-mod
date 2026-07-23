@@ -1,0 +1,129 @@
+plugins {
+    id "com.android.application"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+def requiredReleaseKeystoreKeys = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
+def releaseKeystoreConfigured = requiredReleaseKeystoreKeys.every { keystoreProperties[it] }
+def releaseTaskRequested = gradle.startParameter.taskNames.any { taskName ->
+    taskName.toLowerCase().contains('release')
+}
+def flutterTargetPlatformToAbi = [
+    'android-arm'  : 'armeabi-v7a',
+    'android-arm64': 'arm64-v8a',
+    'android-x64'  : 'x86_64',
+]
+def defaultTargetPlatforms = releaseTaskRequested
+    ? 'android-arm,android-arm64'
+    : 'android-arm,android-arm64,android-x64'
+def apkAbiFilters = (project.findProperty('target-platform') ?: defaultTargetPlatforms)
+    .split(',')
+    .collect { flutterTargetPlatformToAbi[it.trim()] }
+    .findAll { it != null }
+if (releaseTaskRequested) {
+    apkAbiFilters = apkAbiFilters.findAll { it != 'x86_64' }
+}
+if (apkAbiFilters.isEmpty()) {
+    apkAbiFilters = releaseTaskRequested
+        ? ['armeabi-v7a', 'arm64-v8a']
+        : ['armeabi-v7a', 'arm64-v8a', 'x86_64']
+}
+
+android {
+    namespace 'com.ircmobile.app'
+
+    compileSdkVersion flutter.compileSdkVersion
+    ndkVersion flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        // Required by flutter_local_notifications
+        coreLibraryDesugaringEnabled true
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    packaging {
+        jniLibs {
+            if (releaseTaskRequested && !apkAbiFilters.contains('x86_64')) {
+                excludes += ['lib/x86_64/**']
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId "com.ircmobile.app"
+        minSdkVersion flutter.minSdkVersion
+        targetSdkVersion flutter.targetSdkVersion
+        versionCode = flutter.versionCode
+        versionName = flutter.versionName
+        applicationIdSuffix project.findProperty('applicationIdSuffix')
+        ndk {
+            abiFilters(*apkAbiFilters)
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (releaseKeystoreConfigured) {
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            if (releaseKeystoreConfigured) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    applicationVariants.all { variant ->
+        if (variant.buildType.name == 'release') {
+            variant.outputs.each { output ->
+                def abi = output.getFilter(com.android.build.OutputFile.ABI)
+                def abiVersion = ['armeabi-v7a': 1, 'arm64-v8a': 2, 'x86_64': 3][abi]
+                if (abiVersion != null) {
+                    output.versionCodeOverride = abiVersion * 1000 + variant.versionCode
+                }
+            }
+        }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+gradle.taskGraph.whenReady { taskGraph ->
+    if (!releaseKeystoreConfigured &&
+        (taskGraph.hasTask(':app:assembleRelease') ||
+            taskGraph.hasTask(':app:bundleRelease'))) {
+        throw new GradleException(
+            'Release signing is not configured. Copy android/keystore.properties.example to android/keystore.properties and fill it before building APK/AAB.'
+        )
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    // Required by flutter_local_notifications
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+}

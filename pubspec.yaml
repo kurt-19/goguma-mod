@@ -1,0 +1,68 @@
+name: ircmobileapp
+description: An IRC client for mobile devices.
+
+publish_to: 'none'
+
+# Build number is the Git commit count, obtained via:
+#
+#     git rev-list --first-parent --count HEAD
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.0.0
+  flutter: ^3.35.0
+
+dependencies:
+  app_links: ^7.0.0
+  async: ^2.11.0
+  audioplayers: ^6.8.0
+  characters: ^1.4.0
+  connectivity_plus: ^7.0.0
+  crypto: ^3.0.7
+  file_selector: ^1.0.1
+  firebase_core: ^4.0.0
+  firebase_messaging: ^16.0.0
+  flutter:
+    sdk: flutter
+  flutter_apns_only: ^1.6.0
+  flutter_background:
+    path: third_party/flutter_background
+  flutter_local_notifications: ^21.0.0
+  # WebRTC calls disabled to keep release APK smaller; keep for future projects.
+  # flutter_webrtc: ^1.5.2
+  hex: ^0.2.0
+  html: ^0.15.2
+  image_picker: ^1.0.4
+  in_app_purchase: ^3.3.0
+  linkify: ^5.0.0
+  mime: ^2.0.0
+  path: ^1.8.1
+  path_provider: ^2.1.5
+  provider: ^6.0.1
+  record: ^7.1.0
+  
+  # TODO: drop this unmaintained library
+  scrollable_positioned_list:
+    path: third_party/scrollable_positioned_list
+    
+  sentry: ^9.3.0
+  share_handler: ^0.0.25
+  share_plus: ^13.1.0
+  shared_preferences: '^2.0.5'
+  sqflite: ^2.0.2
+  sqflite_common_ffi: ^2.1.0+2
+  unicode_emojis: ^0.5.0
+  unifiedpush: ^6.2.0
+  url_launcher: '^6.0.2'
+  # TODO: replace "webcrypto" with the "cryptography" package once they have a
+  # pure Dart Ecdh.p256 implementation
+  webcrypto: ^0.6.1
+  workmanager: ^0.9.0+3
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

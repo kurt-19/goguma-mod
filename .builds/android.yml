@@ -1,0 +1,83 @@
+image: archlinux
+packages:
+  - android-sdk
+  - android-sdk-build-tools
+  - android-sdk-cmdline-tools-latest
+  - android-sdk-platform-tools
+  - clang
+  - jdk21-openjdk
+  # for flutter
+  - unzip
+sources:
+  - https://codeberg.org/emersion/goguma.git
+secrets:
+  - fa5c1c68-d266-4770-bfc3-a4068b1676a0 # deploy SSH key
+  - 6d21b97d-cd64-4490-b325-acf8b05a542f # keystore.jks
+  - 431b0b53-2af2-441b-b879-86c5913bab4d # keystore.properties
+  - 4e454305-057f-44c3-9a4e-eeb74d54545b # google-services.json
+  - a76ea4e0-b264-4b32-b701-7cadf78b3230 # sentry-dsn.txt
+artifacts:
+  - goguma/build/app/outputs/flutter-apk/app-release.apk
+tasks:
+  - flutter: |
+      git clone --depth=1 --branch=stable https://github.com/flutter/flutter.git
+      export PATH="$PATH:$PWD/flutter/bin"
+      echo "PATH=$PATH" >>~/.buildenv
+      flutter precache --android
+      # need write permission or else licenses are never accepted
+      sudo chown -R $USER /opt/android-sdk
+      yes | flutter doctor --android-licenses >/dev/null
+      flutter doctor -v
+      mkdir -p ~/.gradle
+      # the gradle daemon sometimes crashes
+      echo "org.gradle.daemon=false" >>~/.gradle/gradle.properties
+      # reduce memory usage by sharing the JVM between Gradle and the Kotlin compiler
+      echo "kotlin.compiler.execution.strategy=in-process" >>~/.gradle/gradle.properties
+      # workaround for OOM
+      sudo mkswap -U clear --size 4G --file /swapfile
+      sudo swapon /swapfile
+      # clear package cache to save some disk space
+      yes | yay -Scc
+  - configure: |
+      cd goguma
+      [ -e ~/keystore.properties ] && ln -s ~/keystore.properties android/keystore.properties
+      [ -e ~/keystore.jks ] && ln -s ~/keystore.jks android/keystore.jks
+      flutter pub get
+      if [ -e ~/google-services.json ]; then
+        dart run tool/gen_main.dart --firebase ~/google-services.json lib/main_generated.dart
+      fi
+  - analyze: |
+      cd goguma
+      flutter analyze
+  - test: |
+      cd goguma
+      flutter test --reporter expanded
+  - build: |
+      cd goguma
+      tag="$(git describe --abbrev=0)"
+      hash="$(git rev-parse --short=12 HEAD)"
+      build_name="${tag#v}-dev+$hash"
+      build_number="$(git rev-list --first-parent --count origin/master)"
+      target=lib/main.dart
+      if [ -e ~/google-services.json ]; then
+        build_name="$build_name.firebase"
+        target=lib/main_generated.dart
+      fi
+      sentry_dsn=""
+      [ -e ~/sentry-dsn.txt ] && sentry_dsn="$(cat ~/sentry-dsn.txt)"
+      flutter build apk \
+        --build-name="$build_name" \
+        --build-number="$build_number" \
+        --target="$target" \
+        --dart-define=SENTRY_DSN="$sentry_dsn" \
+        --dart-define=SENTRY_ENVIRONMENT="nightly" \
+        --dart-define=SENTRY_RELEASE="$build_name"
+  - deploy: |
+      cd goguma
+      [ -e ~/.ssh/id_rsa ] || complete-build
+      [ "$(git rev-parse origin/master)" = "$(git rev-parse HEAD)" ] || complete-build
+      build_number="$(git rev-list --first-parent --count origin/master)"
+      ssh_opts="-o StrictHostKeyChecking=no"
+      ssh_host="deploy-goguma@sheeta.emersion.fr"
+      scp $ssh_opts build/app/outputs/flutter-apk/app-release.apk "$ssh_host":fdroid-nightly/repo/goguma-"$build_number".apk
+      ssh $ssh_opts "$ssh_host" "cd fdroid-nightly && (ls -t repo/*.apk | tail -n +5 | xargs -r rm --) && fdroid update"

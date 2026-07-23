@@ -1,0 +1,238 @@
+EUROPEAN.AZ — NGINX + INSPIRCD4 QURASDIRMA ARDICILLIGI
+======================================================
+
+Vacib: addimlari bu sira ile et. Konfiq testi ugurlu olmadan servisi reload etme.
+
+
+1. EHTIYAT NUSXE GOTUR
+----------------------
+
+- Aktiv Nginx site faylinin ehtiyat nusxesini saxla.
+- InspIRCd konfiqinin ehtiyat nusxesini saxla.
+- Paylasilmis kohne gateway/services parollarini deyis ve konfiqde serh kimi de saxlama.
+
+
+2. TEKRAR CHAT SERVER BLOKUNU LEĞV ET
+-------------------------------------
+
+Hazirda iki ayri konfiqde eyni bloklar var:
+
+    server_name chat.european.az;
+
+Yalniz genis konfiqdeki CHAT SUBDOMAIN HTTP ve CHAT SUBDOMAIN HTTPS bloklari aktiv
+qalmalidir. Asagidaki sade ikinci konfiqi aktiv Nginx konfiqinden cixar/deaktiv et:
+
+    server {
+        listen 443 ssl http2;
+        server_name chat.european.az;
+        root /var/www/sp1;
+        ...
+    }
+
+Eyni domen ve port ucun iki server bloku saxlama. Eks halda Nginx bloklardan birini
+ignore ede biler ve /webirc/, /profile-api/, /uploads/ route-lari itmish kimi goruner.
+
+
+3. NGINX-DE /webirc/ BLOKUNU YENILE
+----------------------------------
+
+Genis konfiqdeki her iki /webirc/ blokunu (chat.european.az ve european.az daxilinde)
+asagidaki ile evez et:
+
+    location /webirc/ {
+        proxy_pass https://127.0.0.1:8097/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header Origin $http_origin;
+
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_socket_keepalive on;
+        proxy_cache off;
+
+        # Lokal TLS upstream-dir. Hazirda sertifikat IP adi ile yoxlanmadigi ucun qalir.
+        proxy_ssl_verify off;
+    }
+
+InspIRCd-de nativeping=yes ve pingfreq=30s serverde tesdiqlenene qeder 3600s saxla.
+Bu, Nginx-in default 60 saniyelik idle kesilmesinin qarsisini alir. Server ping-i
+tesdiqlenenden sonra istesen proxy_read_timeout deyerini 90s ede bilersen.
+
+/profile-api/ ve /uploads/ bloklarini genis konfiqde oldugu kimi saxla.
+client_max_body_size 10m qala biler.
+
+
+4. INSPIRCD WEBSOCKET MODULUNU QUR
+---------------------------------
+
+Modullarin yalniz bir defe yuklendigine emin ol:
+
+    <module name="sha1">
+    <module name="websocket">
+
+WebSocket blokunu bele et:
+
+    <websocket defaultmode="text"
+               allowmissingorigin="yes"
+               nativeping="yes"
+               proxyranges="127.0.0.1/32">
+
+    <wsorigin allow="https://chat.european.az">
+
+Izah:
+- allowmissingorigin=yes: Origin gondermeyen native mobil client ucundur.
+- wsorigin: brauzeri yalniz chat.european.az ile mehdudlasdirir.
+- proxyranges: yalniz lokal Nginx-den gelen X-Real-IP/X-Forwarded-For melumatina inanir.
+- proxyranges-e "*" ve ya xarici IP araligi yazma.
+- Gateway/WEBIRC modulunu aktivlesdirme; brauzer ve mobil birbasa WebSocket clientdir.
+
+
+5. 8097 BIND VE CONNECT CLASS
+-----------------------------
+
+Bind bele qala biler:
+
+    <bind address="*"
+          port="8097"
+          type="clients"
+          protocols="tcp"
+          sslprofile="ircnet"
+          hook="websocket">
+
+8097-ye hele birbasa qosulan mobil client varsa address="*" saxla. Butun clientler
+Nginx /webirc/ endpointine kecenden sonra 8097-ni xarice baglayib address="127.0.0.1"
+ede bilersen.
+
+Umumi <connect name="main"> blokundan DERHAL EVVEL bunu elave et:
+
+    <connect name="websocket"
+             parent="main"
+             allow="*"
+             port="8097"
+             pingfreq="30s"
+             resolvehostnames="no"
+             useident="no">
+
+main daxilindeki pingfreq="2m" diger IRC clientler ucun qala biler.
+
+TLS profilinde bunlar qalmalidir:
+
+    tlsv12="yes"
+    tlsv13="yes"
+    requestclientcert="no"
+    renegotiation="no"
+
+
+6. IRCV3 LIVE MESAJ MODULLARI
+-----------------------------
+
+Tarixce/bouncer elave etmeden bunlar aktiv olsun:
+
+    <module name="cap">
+    <module name="ircv3">
+    <module name="ircv3_capnotify">
+    <module name="ircv3_ctctags">
+    <ctctags clientonlytags="all">
+    <module name="ircv3_batch">
+    <module name="ircv3_echomessage">
+    <module name="ircv3_msgid">
+    <module name="ircv3_servertime">
+
+Web ve mobil client bunu istemelidir:
+
+    CAP REQ :message-tags server-time batch echo-message
+
+Custom ircv3_message_redaction modulu serverde qurasdirilibsa silme ucun elave et:
+
+    CAP REQ :draft/message-redaction
+
+Bu modul standart InspIRCd paketine daxil deyil. Modul fayli serverde yoxdursa onu
+konfiqde aktiv saxlama; /REHASH module not found xetasi verecek.
+
+
+7. WEB VE MOBIL WEBSOCKET URL-NI BIRLESDIR
+-----------------------------------------
+
+Web .env daxilinde bunu istifade et:
+
+    VITE_DEFAULT_IRC_SERVER=wss://chat.european.az/webirc/
+
+Mobil ucun de eyni endpointi environment/base configuration vasitesile ver:
+
+    wss://chat.european.az/webirc/
+
+Koda domaini birbasa yazma. Web .env deyisikliyi yalniz yeni frontend build/deploy-dan
+sonra tetbiq olunur.
+
+API ucun webde relative base URL istifade et:
+
+    /profile-api/
+
+Mobilde eyni URL environment-den tam formada verile biler:
+
+    https://chat.european.az/profile-api/
+
+
+8. YOXLAMA VE TETBIQ SIRASI
+---------------------------
+
+1) Evvel Nginx konfiqini yoxla:
+
+    sudo nginx -t
+
+2) Yalniz test ugurludursa Nginx-i reload et:
+
+    sudo systemctl reload nginx
+
+3) IRC operator clientinden InspIRCd konfiqini yeniden oxut:
+
+    /REHASH
+
+4) Brauzer Developer Tools -> Network -> WS bolmesinde bunu yoxla:
+
+    wss://chat.european.az/webirc/
+    Status: 101 Switching Protocols
+
+5) Bir mesaj gonder, sehifeni 10 deqiqe arxa plana kecir ve ikinci clientden mesaj
+gonder. Qayidanda mesajlar birden partlayis kimi yox, socket aciq qaldigi muddetde
+live qebul edilmelidir.
+
+6) Problem olsa Nginx error logunda upstream timed out, duplicate/conflicting
+server_name ve WebSocket 400/403 xetalarina bax.
+
+
+9. ETME
+-------
+
+- <wsorigin allow="*"> yazma.
+- proxyranges="*" yazma.
+- Gateway/WEBIRC modulunu The Lounge/BNC yoxdursa aktiv etme.
+- Eyni chat.european.az:443 server blokunu iki faylda saxlama.
+- nginx -t ugursuz olduqda reload/restart etme.
+- Secret, token ve gateway parolunu konfiq numunesinde saxlama.
+- chanhistory/bouncer aktiv etme; bu qurulus live socket ucundur.
+
+
+QEYD
+----
+
+Brauzer/telefon emeliyyat sistemi Chrome prosesini tam dayandirarsa history olmadan
+offline araliqdaki mesaji sonradan berpa etmek mumkun deyil. Bu konfiq Chrome prosesi
+ve internet aktiv oldugu muddetde socketin donmasini tez askarlayib baglantini saglam
+saxlamaq ucundur.
+
+Resmi istinadlar:
+https://docs.inspircd.org/4/modules/websocket/
+https://docs.inspircd.org/4/configuration/#connect
+https://nginx.org/en/docs/http/websocket.html

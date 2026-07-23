@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>fr.emersion.goguma</id>
+  <name>IRC M - LITE</name>
+  <summary>IRC client for mobile devices</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+  <developer id="fr.emersion">
+    <name>Simon Ser</name>
+  </developer>
+  <description>
+    <p>
+      Goguma is an IRC client for mobile devices. It supports IRCv3 extensions
+      such as chathistory, read markers, and push notifications via soju.
+    </p>
+  </description>
+  <url type="homepage">https://codeberg.org/emersion/goguma</url>
+  <url type="bugtracker">https://codeberg.org/emersion/goguma/issues</url>
+  <url type="vcs-browser">https://codeberg.org/emersion/goguma</url>
+  <launchable type="desktop-id">fr.emersion.goguma.desktop</launchable>
+  <provides>
+    <binary>goguma</binary>
+  </provides>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+  </content_rating>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://fs.emersion.fr/protected/img/goguma/main.png</image>
+      <caption>Conversation list</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://fs.emersion.fr/protected/img/goguma/conversation.png</image>
+      <caption>Conversation view</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://fs.emersion.fr/protected/img/goguma/conversation-details.png</image>
+      <caption>Conversation details</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://fs.emersion.fr/protected/img/goguma/main-dark.png</image>
+      <caption>Conversation list in dark mode</caption>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary">#3f51b5</color>
+  </branding>
+</component>
