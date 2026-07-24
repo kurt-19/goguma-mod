@@ -413,7 +413,7 @@ class _ConnectPageState extends State<ConnectPage> {
     var keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
     const fieldGap = 8.0;
     const fieldHeight = 44.0;
-    const serverDisplayName = 'Azerbaijan [AZ] IRC network';
+    const serverDisplayName = 'Azerbaijan IRC network';
     const connectButtonHeight = 40.0;
     const fieldTextAlignVertical = TextAlignVertical.center;
     var fieldTextStyle = TextStyle(
